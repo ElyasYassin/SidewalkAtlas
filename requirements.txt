@@ -1,0 +1,19 @@
+# Perception & segmentation
+transformers>=4.40.0
+torch>=2.2.0
+torchvision>=0.17.0
+
+# Image handling
+Pillow>=10.0.0
+
+# Visualization
+matplotlib>=3.8.0
+
+# Numerics
+numpy>=1.26.0
+
+# HTTP (used by transformers model download and image fetching)
+requests>=2.31.0
+
+# Grounding DINO (zero-shot object detection)
+# Included in transformers>=4.38 — no extra install needed
