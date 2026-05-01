@@ -6,9 +6,9 @@ Supports two model presets:
   ade20k     — 150 classes, broader scene understanding (better for sim)
 
 Usage:
-    python scripts/segment_sidewalk.py                  # default: ade20k
-    python scripts/segment_sidewalk.py --model ade20k
-    python scripts/segment_sidewalk.py --model cityscapes
+    python scripts/segment_sidewalk.py                                        # default: ade20k, images/
+    python scripts/segment_sidewalk.py --images-dir images/original_screenshots
+    python scripts/segment_sidewalk.py --model cityscapes --images-dir images/original_screenshots
 """
 
 import argparse
@@ -69,12 +69,7 @@ ADE20K_COLORS[13] = [210, 180, 140]   # earth/ground — tan
 
 PRESETS["ade20k"]["colors"] = ADE20K_COLORS
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-
-IMAGES_DIR = Path(__file__).parent.parent / "images"
-OUTPUT_DIR  = Path(__file__).parent.parent / "images" / "segmentation_output"
+PROJECT_ROOT = Path(__file__).parent.parent
 
 # ---------------------------------------------------------------------------
 # Model loading
@@ -137,7 +132,7 @@ def sidewalk_overlay(image: Image.Image, pred: np.ndarray, sidewalk_labels: set)
     return np.clip(img, 0, 255).astype(np.uint8)
 
 
-def plot_results(image, pred, image_name, preset, model_key):
+def plot_results(image, pred, image_name, preset, model_key, output_dir: Path):
     colors         = preset["colors"]
     classes        = preset["classes"]
     sidewalk_labels = preset["sidewalk_labels"]
@@ -171,7 +166,7 @@ def plot_results(image, pred, image_name, preset, model_key):
     axes[2].axis("off")
 
     plt.tight_layout()
-    out_path = OUTPUT_DIR / f"{Path(image_name).stem}_{model_key}_seg.png"
+    out_path = output_dir / f"{Path(image_name).stem}_{model_key}_seg.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"[save] {out_path}")
@@ -183,18 +178,23 @@ def plot_results(image, pred, image_name, preset, model_key):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=["cityscapes", "ade20k"], default="ade20k")
+    parser.add_argument("--images-dir", type=Path, default=PROJECT_ROOT / "images",
+                        help="Directory containing input images")
     args = parser.parse_args()
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    images_dir = args.images_dir
+    output_dir = images_dir / "segmentation_output"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     image_paths = [
-        p for p in sorted(IMAGES_DIR.glob("*.png")) + sorted(IMAGES_DIR.glob("*.jpg"))
-        if p.parent == IMAGES_DIR
+        p for p in sorted(images_dir.glob("*.png")) + sorted(images_dir.glob("*.jpg"))
+        if p.parent == images_dir
     ]
     if not image_paths:
-        print(f"[error] No images found in {IMAGES_DIR}")
+        print(f"[error] No images found in {images_dir}")
         return
 
+    print(f"[info] {len(image_paths)} images found in {images_dir}")
     preset = PRESETS[args.model]
     extractor, model, device = load_model(preset)
 
@@ -209,9 +209,9 @@ def main():
         print(f"  Classes detected: {detected}")
         print(f"  Sidewalk/path coverage: {np.isin(pred, list(sidewalk_labels)).mean() * 100:.1f}%")
 
-        plot_results(image, pred, img_path.name, preset, args.model)
+        plot_results(image, pred, img_path.name, preset, args.model, output_dir)
 
-    print(f"\n[done] Results saved to {OUTPUT_DIR}")
+    print(f"\n[done] Results saved to {output_dir}")
 
 
 if __name__ == "__main__":

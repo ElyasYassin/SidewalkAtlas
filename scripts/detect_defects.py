@@ -9,7 +9,8 @@ Pipeline:
 
 Usage:
     python scripts/detect_defects.py
-    python scripts/detect_defects.py --box-threshold 0.25 --text-threshold 0.2
+    python scripts/detect_defects.py --images-dir images/original_screenshots
+    python scripts/detect_defects.py --images-dir images/original_screenshots --box-threshold 0.25
 """
 
 import argparse
@@ -32,8 +33,7 @@ from transformers import (
 # Config
 # ---------------------------------------------------------------------------
 
-IMAGES_DIR = Path(__file__).parent.parent / "images"
-OUTPUT_DIR  = Path(__file__).parent.parent / "images" / "defect_detection_output"
+PROJECT_ROOT = Path(__file__).parent.parent
 
 SEGFORMER_MODEL = "nvidia/segformer-b5-finetuned-ade-640-640"
 GDINO_MODEL     = "IDEA-Research/grounding-dino-base"
@@ -177,6 +177,7 @@ def draw_detections(
     detections: list[dict],
     image_name: str,
     model_info: str,
+    output_dir: Path,
 ):
     fig, axes = plt.subplots(1, 3, figsize=(20, 6))
     fig.suptitle(f"{image_name}  |  {model_info}", fontsize=13)
@@ -228,7 +229,7 @@ def draw_detections(
         )
 
     plt.tight_layout()
-    out_path = OUTPUT_DIR / f"{Path(image_name).stem}_defects.png"
+    out_path = output_dir / f"{Path(image_name).stem}_defects.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  [save] {out_path}")
@@ -239,11 +240,16 @@ def draw_detections(
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--images-dir", type=Path, default=PROJECT_ROOT / "images",
+                        help="Directory containing input images")
     parser.add_argument("--box-threshold",  type=float, default=DEFAULT_BOX_THRESHOLD)
     parser.add_argument("--text-threshold", type=float, default=DEFAULT_TEXT_THRESHOLD)
     args = parser.parse_args()
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    images_dir = args.images_dir
+    output_dir = images_dir / "defect_detection_output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[device] {device}\n")
 
@@ -251,12 +257,14 @@ def main():
     gdino_processor, gdino_model = load_gdino(device)
 
     image_paths = [
-        p for p in sorted(IMAGES_DIR.glob("*.png")) + sorted(IMAGES_DIR.glob("*.jpg"))
-        if p.parent == IMAGES_DIR
+        p for p in sorted(images_dir.glob("*.png")) + sorted(images_dir.glob("*.jpg"))
+        if p.parent == images_dir
     ]
     if not image_paths:
-        print(f"[error] No images found in {IMAGES_DIR}")
+        print(f"[error] No images found in {images_dir}")
         return
+
+    print(f"[info] {len(image_paths)} images found in {images_dir}")
 
     for img_path in image_paths:
         print(f"\n[image] {img_path.name}")
@@ -278,9 +286,9 @@ def main():
             print(f"    {d['label']:30s}  score={d['score']:.3f}  box={[round(v) for v in d['box']]}")
 
         model_info = f"SegFormer ADE20K + Grounding DINO  |  box≥{args.box_threshold}  text≥{args.text_threshold}"
-        draw_detections(image, mask, detections, img_path.name, model_info)
+        draw_detections(image, mask, detections, img_path.name, model_info, output_dir)
 
-    print(f"\n[done] Results in {OUTPUT_DIR}")
+    print(f"\n[done] Results in {output_dir}")
 
 
 if __name__ == "__main__":
