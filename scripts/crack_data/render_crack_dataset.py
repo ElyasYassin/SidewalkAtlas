@@ -57,6 +57,11 @@ ap.add_argument("--subframes", type=int, default=6)
 ap.add_argument("--seed", type=int, default=7)
 ap.add_argument("--aa", type=int, default=4, help="/rtx/post/aa/op: 3 DLSS, 4 DLAA")
 ap.add_argument("--validate", action="store_true")
+ap.add_argument("--shard", type=int, default=0, help="render scenes i with i %% nshards == shard")
+ap.add_argument("--nshards", type=int, default=1)
+ap.add_argument("--follow", type=int, default=0,
+                help="keep picking up newly generated scenes until this many exist "
+                     "and are rendered (run alongside generate_crack_scenes.py)")
 args, _ = ap.parse_known_args()
 
 from isaacsim import SimulationApp  # noqa: E402
@@ -412,7 +417,7 @@ def calibrate_exposure(meta, labels, hm, light_info):
     # Search log(scale) inside a shrinking bracket. The ratio^2.2 step is only
     # a proposal: saturation hides how far over we are, so a saturated
     # reading just halves the scale and tightens the upper bound.
-    log_lo, log_hi = math.log(0.01), math.log(20.0)
+    log_lo, log_hi = math.log(0.002), math.log(500.0)   # deep shade needs a lot
     cur = 0.0
     mean = None
     for _ in range(10):
@@ -504,6 +509,18 @@ def set_camera(pos, fwd, roll_deg, hfov_deg):
 
 
 def sample_view(meta):
+    """Spot-like pose with the camera ON the sidewalk (Spot walks it; it is
+    never behind the frontage wall or out in the road)."""
+    W = meta["width_m"]
+    for _ in range(30):
+        out = _sample_view(meta)
+        y = out[0][1]
+        if 0.1 <= y <= W - 0.1:
+            return out
+    return out
+
+
+def _sample_view(meta):
     """Spot-like pose; aim at a crack most of the time, at a decoy some."""
     L, W = meta["length_m"], meta["width_m"]
     lines = meta["centerlines"]
@@ -679,25 +696,58 @@ def settle(n=40):
 def main():
     for sub in ("rgb", "depth", "depth_stereo", "mask"):
         os.makedirs(os.path.join(args.out, sub), exist_ok=True)
-    scene_dirs = sorted(d for d in os.listdir(args.scenes)
-                        if os.path.exists(os.path.join(args.scenes, d, "scene.json")))
-    scene_dirs = scene_dirs[args.start:args.start + args.count]
-    index_path = os.path.join(args.out, "frames.jsonl" if not args.validate else "validate.jsonl")
+    import glob as _glob
+    if args.validate:
+        index_path = os.path.join(args.out, "validate.jsonl")
+    elif args.nshards > 1:
+        index_path = os.path.join(args.out, f"frames_{args.shard}.jsonl")
+    else:
+        index_path = os.path.join(args.out, "frames.jsonl")
     done = set()
-    if os.path.exists(index_path) and not args.validate:
-        with open(index_path) as fh:
-            done = {json.loads(l)["scene_id"] for l in fh if l.strip()}
+    if not args.validate:   # resume across every shard's index
+        for fp in _glob.glob(os.path.join(args.out, "frames*.jsonl")):
+            with open(fp) as fh:
+                done |= {json.loads(l)["scene_id"] for l in fh if l.strip()}
+
+    def pending():
+        ready = sorted(d for d in os.listdir(args.scenes)
+                       if os.path.exists(os.path.join(args.scenes, d, "scene.json")))
+        ready = ready[args.start:args.start + args.count]
+        return [d for i, d in enumerate(ready)
+                if i % args.nshards == args.shard and d not in done]
+
+    def scene_stream():
+        """Yield scenes as they become ready. With --follow, wait for the
+        generator; give up after 15 idle minutes."""
+        idle = 0.0
+        while True:
+            todo = pending()
+            if todo:
+                idle = 0.0
+                yield todo[0]
+                continue
+            n_ready = len([d for d in os.listdir(args.scenes)
+                           if os.path.exists(os.path.join(args.scenes, d, "scene.json"))])
+            if not args.follow or n_ready >= args.follow or idle > 900:
+                return
+            time.sleep(20)
+            idle += 20
+
     log = open(index_path, "a")
     UsdGeom.Xform.Define(stage, "/World/Looks")
     t_start = time.time()
     n_frames = 0
     ious, tols = [], []
-    for si, sd in enumerate(scene_dirs):
+    for si, sd in enumerate(scene_stream()):
+        done.add(sd)
         scene_dir = os.path.join(args.scenes, sd)
-        meta = json.load(open(os.path.join(scene_dir, "scene.json")))
-        sid = meta["scene_id"]
-        if sid in done:
+        try:   # the generator may still be writing this file
+            meta = json.load(open(os.path.join(scene_dir, "scene.json")))
+        except (json.JSONDecodeError, OSError):
+            done.discard(sd)
+            time.sleep(5)
             continue
+        sid = meta["scene_id"]
         lab = np.load(os.path.join(scene_dir, "labels.npz"))
         labels, width01 = lab["labels"], lab["width01mm"]
         hm = np.load(os.path.join(scene_dir, "height_mesh.npy"))
@@ -788,7 +838,7 @@ def main():
             vi += 1
             n_frames += 1
         el = time.time() - t_start
-        print(f"scene {si + 1}/{len(scene_dirs)} {sid}: {vi} views, "
+        print(f"[shard {args.shard}] scene {si + 1} {sid}: {vi} views, "
               f"{n_frames} frames total, {el / max(n_frames, 1):.1f}s/frame, "
               f"{el / 60:.1f} min", flush=True)
     log.close()

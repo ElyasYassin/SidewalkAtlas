@@ -1044,7 +1044,7 @@ def generate_scene(seed: int, params: SceneParams = None) -> Scene:
             m = _polyline_mask(shape, x0, y0, pts, rng.uniform(0.008, 0.03))
             m = cv2.GaussianBlur(m.astype(np.float32), (0, 0), 1.5) > 0.4
             albedo[m] = np.array([0.015, 0.015, 0.016], np.float32) * rng.uniform(0.8, 1.6)
-            rough[m] = rng.uniform(0.2, 0.4)
+            rough[m] = rng.uniform(0.45, 0.6)   # semi-matte; lower mirrors the sky
             height[m] = np.maximum(height[m], 0.0) + 0.001
             covered |= m
             distractors.append({"type": "sealant", "xy": np.round(pts[::40], 4).tolist()})

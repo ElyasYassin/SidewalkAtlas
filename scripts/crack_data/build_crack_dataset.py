@@ -112,8 +112,9 @@ def main():
     out = os.path.join(a.render, "dataset")
     os.makedirs(out, exist_ok=True)
 
-    frames = [json.loads(l) for l in open(os.path.join(a.render, "frames.jsonl"))
-              if l.strip()]
+    import glob
+    frames = [json.loads(l) for fp in sorted(glob.glob(os.path.join(a.render, "frames*.jsonl")))
+              for l in open(fp) if l.strip()]
     scene_ids = sorted({f["scene_id"] for f in frames})
     metas = {s: json.load(open(os.path.join(a.scenes, s, "scene.json")))
              for s in scene_ids}
