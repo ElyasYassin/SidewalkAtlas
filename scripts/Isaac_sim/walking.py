@@ -40,9 +40,43 @@ DEBUG_SAVE_EVERY_N_STEPS = 500
 DEBUG_DIR = "C:/Users/Elyas/sidewalk_dataset/walk_debug"
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
+# Live perception window (omni.ui inside Isaac Sim):
+# RGB | walkable mask overlay | binary sidewalk / not-sidewalk.
+# Visualization only -- does not touch navigation.
+LIVE_VIEW_ENABLED = True
+LIVE_VIEW_EVERY_N_STEPS = 40      # ~10 updates/sec at 500 Hz
+LIVE_VIEW_MAX_HEIGHT = 240        # downscale composite before pushing, to stay cheap
+SIDEWALK_COLOR = (0, 200, 0)
+NOT_SIDEWALK_COLOR = (55, 55, 55)
+DEPTH_VIEW_MAX_M = 10.0           # depth colormap range (m)
+
+# Coverage: stamp a swath ahead of Spot into a world grid as it walks, and
+# show a live top-down Coverage Map (green = swept, blue = path).
+COVERAGE_ENABLED = True
+COVERAGE_CELL_M = 0.05            # 5 cm world cells
+# Swath = the corridor Spot is considered to "cover" as it passes. Made wide
+# (approaching real sidewalk width) and spanning from behind the body to ahead
+# so consecutive stamps merge into one continuous, fuller band on the map.
+COVERAGE_SWATH_WIDTH_M = 1.6      # cross-track footprint (m)
+COVERAGE_SWATH_LEN_M = 1.6        # along-track footprint (m)
+COVERAGE_SWATH_AHEAD_M = -0.6     # swath starts this far ahead of body (negative = behind)
+COVERAGE_MARK_EVERY_N_STEPS = 12  # how often to stamp the swath (denser = fewer gaps)
+COVERAGE_MAP_PATH = os.path.join(DEBUG_DIR, "coverage_map.png")
+
+# Coverage-seeking weave: instead of tracking only the centerline, zig-zag
+# across the sidewalk width so Spot actually covers the whole surface. It aims
+# toward one edge, and flips to the other edge once its near footprint reaches
+# the current side. Set False for plain centerline-following.
+COVERAGE_SWEEP_ENABLED = True
+SWEEP_FRACTION = 0.7              # aim this far from center toward the edge (0..1)
+SWEEP_EDGE_FRAC = 0.15           # "reached edge" when that side's near band < this*total
+
 # Walking
-NOMINAL_FORWARD_SPEED = 0.28
-MIN_FORWARD_SPEED = 0.08
+# The Spot policy was trained with lin_vel_x command range [-2.0, 3.0] m/s
+# (from spot_env.yaml). 0.28 is only ~9% of max -> a barely-visible crawl that
+# looks frozen. Command a real fraction of the range so it actually strides.
+NOMINAL_FORWARD_SPEED = 1.0
+MIN_FORWARD_SPEED = 0.3
 WALK_DURATION_STEPS = 100000  # 100000 / 500 = 200 seconds
 
 # PID / PD steering controller
@@ -73,8 +107,9 @@ MIN_NEAR_PIXELS = 800
 # Diagnostic
 FORCE_FORWARD = False
 
-# Classes that count as walkable for navigation
-WALKABLE_CLASSES = {"sidewalk", "defect"}
+# Classes that count as walkable for navigation.
+# Binary segmentation: every walkable surface is tagged "sidewalk".
+WALKABLE_CLASSES = {"sidewalk"}
 
 
 # =====================================================================
@@ -123,7 +158,11 @@ def tag_walkables():
             sem_api.CreateSemanticTypeAttr("class")
             sem_api.CreateSemanticDataAttr(class_name)
 
-    DEFECTS = [
+    # Every walkable surface (the sidewalk mesh plus the defect patches that
+    # sit on it) is tagged "sidewalk". These are the same meshes that were
+    # walkable before, so the navigation mask is unchanged -- only the label.
+    # Curbs and everything else stay untagged and read as "not sidewalk".
+    SIDEWALK = [
         "/World/assembly_City/collapsed_1",
         "/World/assembly_City/collapsed_2",
         "/World/assembly_City/collapsed_3",
@@ -144,28 +183,18 @@ def tag_walkables():
         "/World/assembly_City/Meshy_AI_sidewalk_0404170947_texture",
     ]
 
-    CURBS = [
-        "/World/assembly_City/Meshy_AI_Curved_curb_along_a_q_0521183005_texture",
-        "/World/assembly_City/Meshy_AI_Yellow_curb_beside_th_0521183948_texture",
-        "/World/assembly_City/Meshy_AI_Mossy_Curb_Along_the__0521183157_texture",
-    ]
-
     tagged = 0
 
-    for paths, cls in [
-        (DEFECTS, "defect"),
-        (CURBS, "curb"),
-    ]:
-        for p in paths:
-            prim = stage.GetPrimAtPath(p)
+    for p in SIDEWALK:
+        prim = stage.GetPrimAtPath(p)
 
-            if prim.IsValid():
-                tag(prim, cls)
-                tagged += 1
-            else:
-                print(f"⚠ Prim not found for semantic tag: {p}")
+        if prim.IsValid():
+            tag(prim, "sidewalk")
+            tagged += 1
+        else:
+            print(f"⚠ Prim not found for semantic tag: {p}")
 
-    print(f"✓ Tagged {tagged} prims with semantic classes")
+    print(f"✓ Tagged {tagged} prims as sidewalk")
 
 
 # =====================================================================
@@ -190,6 +219,22 @@ _state = {
 
     "last_debug": None,
     "walkable_ids": set(),
+
+    # Live perception + coverage windows
+    "viz_provider": None,
+    "viz_window": None,
+    "coverage_provider": None,
+    "coverage_window": None,
+    "last_live_step": 0,
+
+    # Coverage grid
+    "coverage_covered": set(),   # cells swept by the sensor swath
+    "coverage_track": [],        # spot world (x,y) over time
+    "last_coverage_step": 0,
+
+    # Coverage weave
+    "sweep_dir": 1.0,            # +1 = aim toward right edge, -1 = left edge
+    "sweep_flips": 0,
 
     # Navigation memory
     "last_turn_direction": 1.0,
@@ -757,10 +802,50 @@ def compute_velocity_command(mask):
         return make_command(forward, turn), left, center, right
 
     a, b = best_interval
-    sidewalk_center_x = (a + b) / 2.0
+    near_center_x = (a + b) / 2.0
     sidewalk_width = b - a + 1
 
-    error = (sidewalk_center_x - image_center) / image_center
+    # ---------------------------------------------------------------
+    # Follow the sidewalk DIRECTION: blend the near-band center with the
+    # lookahead-band centroid so Spot turns to follow where the walk goes
+    # (curves / drift), not just what's at its feet. This is the
+    # "assess left/right" signal that was missing.
+    # ---------------------------------------------------------------
+    look_cols = lookahead.sum(axis=0).astype(np.float64)
+    if look_cols.sum() > 0:
+        lookahead_center_x = float(
+            (np.arange(w) * look_cols).sum() / look_cols.sum()
+        )
+    else:
+        lookahead_center_x = near_center_x
+
+    base_center_x = 0.5 * near_center_x + 0.5 * lookahead_center_x
+
+    centerline_err = (base_center_x - image_center) / image_center
+    centerline_err = float(np.clip(centerline_err, -1.0, 1.0))
+
+    # ---------------------------------------------------------------
+    # Coverage weave: steer toward one edge of the walk, flipping to the
+    # other once this side's near footprint runs out of sidewalk. This
+    # makes Spot cover the full width instead of only the centerline.
+    # ---------------------------------------------------------------
+    if COVERAGE_SWEEP_ENABLED:
+        half = sidewalk_width / 2.0
+
+        if _state["sweep_dir"] > 0:
+            edge_reached = near_right < SWEEP_EDGE_FRAC * near_total
+        else:
+            edge_reached = near_left < SWEEP_EDGE_FRAC * near_total
+
+        if edge_reached:
+            _state["sweep_dir"] *= -1.0
+            _state["sweep_flips"] += 1
+
+        steer_target_x = base_center_x + _state["sweep_dir"] * SWEEP_FRACTION * half
+    else:
+        steer_target_x = base_center_x
+
+    error = (steer_target_x - image_center) / image_center
     error = float(np.clip(error, -1.0, 1.0))
 
     _state["last_sidewalk_error"] = error
@@ -779,33 +864,33 @@ def compute_velocity_command(mask):
     turn = compute_pid_turn(pid_error, dt)
 
     # ---------------------------------------------------------------
-    # Forward speed scheduling
+    # Forward speed scheduling — keyed on CENTERLINE alignment, not the
+    # sweep target, so the intentional weave doesn't throttle forward speed.
     # ---------------------------------------------------------------
     center_ratio = near_center / max(near_total, 1)
-    abs_error = abs(error)
+    abs_c = abs(centerline_err)
 
-    lower_center_weak = center_ratio < 0.20
+    lower_center_weak = center_ratio < 0.15
 
     if lower_center_weak:
-        forward = 0.0
+        forward = 0.2
 
-    elif abs_error < 0.10 and sidewalk_width > 0.40 * w:
+    elif abs_c < 0.20 and sidewalk_width > 0.40 * w:
         forward = NOMINAL_FORWARD_SPEED
 
-    elif abs_error < 0.25:
-        forward = 0.18
+    elif abs_c < 0.35:
+        forward = 0.6
 
-    elif abs_error < 0.45:
-        forward = 0.08
+    elif abs_c < 0.55:
+        forward = 0.4
 
     else:
-        forward = 0.0
+        forward = 0.2
 
-    if abs(turn) > 0.35:
-        forward = min(forward, 0.06)
-
-    if forward > 0.10:
-        turn = float(np.clip(turn, -0.25, 0.25))
+    # Slow down when turning hard (sharp weave / correction) so Spot stays on
+    # the walk, but keep enough speed that the gait keeps striding.
+    if abs(turn) > 0.4:
+        forward = min(forward, 0.4)
 
     forward, turn = smooth_command(forward, turn, alpha=0.45)
 
@@ -865,6 +950,331 @@ def make_debug_image(rgb, mask):
         return img
 
     return np.hstack([add_lines(rgb), add_lines(overlay)])
+
+
+def make_sidewalk_binary_image(mask):
+    """
+    Binary sidewalk / not-sidewalk view from the navigation mask:
+    sidewalk pixels green, everything else dark gray, with a small legend.
+    """
+    if mask is None:
+        return None
+
+    mask = np.asarray(mask).astype(bool)
+    h, w = mask.shape
+
+    img = np.empty((h, w, 3), dtype=np.uint8)
+    img[...] = NOT_SIDEWALK_COLOR
+    img[mask] = SIDEWALK_COLOR
+
+    try:
+        from PIL import Image as PILImage, ImageDraw
+
+        pil = PILImage.fromarray(img)
+        draw = ImageDraw.Draw(pil)
+        for i, (label, color) in enumerate(
+            [("sidewalk", SIDEWALK_COLOR), ("not sidewalk", NOT_SIDEWALK_COLOR)]
+        ):
+            y = 4 + i * 16
+            draw.rectangle([4, y, 16, y + 12], fill=color, outline=(255, 255, 255))
+            draw.text((20, y), label, fill=(255, 255, 255))
+        img = np.array(pil)
+    except Exception:
+        pass
+
+    return img
+
+
+def draw_region_lines(img):
+    """Overlay the navigation region gridlines on a copy of img."""
+    img = img.copy()
+    h, w = img.shape[:2]
+
+    img[:, w // 3 - 1 : w // 3 + 1] = [255, 0, 0]
+    img[:, 2 * w // 3 - 1 : 2 * w // 3 + 1] = [255, 0, 0]
+
+    y1 = h // 2
+    y2 = 5 * h // 6
+    img[y1 - 1 : y1 + 1, :] = [255, 255, 0]
+    img[y2 - 1 : y2 + 1, :] = [255, 255, 0]
+
+    near_y = 2 * h // 3
+    img[near_y - 1 : near_y + 1, :] = [0, 255, 255]
+
+    return img
+
+
+def make_depth_view():
+    """
+    Colorized depth image from the depth annotator (near = blue, far = red),
+    normalized by the 2nd/98th percentiles for contrast.
+    """
+    depth_data = _state["depth_annotator"].get_data()
+    depth = extract_depth_array(depth_data)
+
+    if depth is None:
+        return None
+
+    valid = np.isfinite(depth) & (depth > 0)
+    if not valid.any():
+        return np.zeros((*depth.shape, 3), dtype=np.uint8)
+
+    lo = np.percentile(depth[valid], 2)
+    hi = min(np.percentile(depth[valid], 98), DEPTH_VIEW_MAX_M)
+    d = np.clip((depth - lo) / (hi - lo + 1e-6), 0.0, 1.0)
+
+    # Jet-like colormap: near (0) -> blue, far (1) -> red.
+    r = np.clip(1.5 - np.abs(4.0 * d - 3.0), 0.0, 1.0)
+    g = np.clip(1.5 - np.abs(4.0 * d - 2.0), 0.0, 1.0)
+    b = np.clip(1.5 - np.abs(4.0 * d - 1.0), 0.0, 1.0)
+
+    img = (np.stack([r, g, b], axis=-1) * 255.0).astype(np.uint8)
+    img[~valid] = 0
+    return img
+
+
+# =====================================================================
+# COVERAGE GRID
+# =====================================================================
+
+def _cell_of(x, y):
+    return (int(np.floor(x / COVERAGE_CELL_M)),
+            int(np.floor(y / COVERAGE_CELL_M)))
+
+
+def get_spot_world_pose():
+    """Return (x, y, heading_rad) of Spot in the world, from the stage."""
+    stage = omni.usd.get_context().get_stage()
+    body = stage.GetPrimAtPath(f"{SPOT_PRIM_PATH}/body")
+    if not body.IsValid():
+        return None
+    m = UsdGeom.Xformable(body).ComputeLocalToWorldTransform(
+        Usd.TimeCode.Default()
+    )
+    pos = m.ExtractTranslation()
+    fwd = m.TransformDir((1.0, 0.0, 0.0))
+    heading = float(np.arctan2(fwd[1], fwd[0]))
+    return float(pos[0]), float(pos[1]), heading
+
+
+def mark_coverage_swath():
+    """Stamp the sensor swath (a rectangle ahead of Spot) into the covered set."""
+    if not COVERAGE_ENABLED:
+        return
+    pose = get_spot_world_pose()
+    if pose is None:
+        return
+    cx, cy, heading = pose
+    _state["coverage_track"].append((cx, cy))
+
+    c, s = np.cos(heading), np.sin(heading)
+    half_w = COVERAGE_SWATH_WIDTH_M / 2.0
+    step = COVERAGE_CELL_M / 2.0
+    us = np.arange(-half_w, half_w + 1e-9, step)
+    vs = np.arange(COVERAGE_SWATH_AHEAD_M,
+                   COVERAGE_SWATH_AHEAD_M + COVERAGE_SWATH_LEN_M + 1e-9, step)
+    covered = _state["coverage_covered"]
+    for v in vs:
+        for u in us:
+            wx = cx + (c * v - s * u)
+            wy = cy + (s * v + c * u)
+            covered.add(_cell_of(wx, wy))
+
+
+def render_coverage_map():
+    """Top-down RGB coverage image: covered cells green, Spot track blue."""
+    covered = _state["coverage_covered"]
+    track = _state["coverage_track"]
+    if not covered:
+        return None
+
+    xs = [c[0] for c in covered]
+    ys = [c[1] for c in covered]
+    min_i, max_i = min(xs), max(xs)
+    min_j, max_j = min(ys), max(ys)
+    W = max_i - min_i + 1
+    H = max_j - min_j + 1
+    if W * H > 20_000_000:
+        return None
+
+    img = np.zeros((H, W, 3), dtype=np.uint8)
+    for (i, j) in covered:
+        img[j - min_j, i - min_i] = (60, 200, 90)   # covered = green
+
+    for (wx, wy) in track:
+        i, j = _cell_of(wx, wy)
+        ii, jj = i - min_i, j - min_j
+        if 0 <= jj < H and 0 <= ii < W:
+            img[jj, ii] = (80, 140, 235)             # track = blue
+
+    return np.flipud(img)   # +y world points up
+
+
+def save_coverage_map():
+    """Write the coverage map PNG and print swept-area stats."""
+    if not COVERAGE_ENABLED:
+        return
+    img = render_coverage_map()
+    if img is None:
+        print("⚠ No coverage cells recorded; skipping map.")
+        return
+
+    Image.fromarray(img).save(COVERAGE_MAP_PATH)
+    area = len(_state["coverage_covered"]) * COVERAGE_CELL_M * COVERAGE_CELL_M
+    print(f"✓ Coverage map saved to {COVERAGE_MAP_PATH}")
+    print(f"  covered cells: {len(_state['coverage_covered'])}  "
+          f"(~{area:.2f} m^2)  track points: {len(_state['coverage_track'])}")
+
+
+# =====================================================================
+# LIVE PERCEPTION VIEW (omni.ui window inside Isaac Sim)
+# =====================================================================
+
+def _make_image_window(title, width, height, px, py):
+    """Create an omni.ui window holding a single provider-backed image."""
+    import omni.ui as ui
+
+    provider = ui.ByteImageProvider()
+    window = ui.Window(
+        title, width=width, height=height, position_x=px, position_y=py
+    )
+    with window.frame:
+        try:
+            image = ui.ImageWithProvider(provider)
+            for attr in ("IWP_PRESERVE_ASPECT_FIT", "PRESERVE_ASPECT_FIT"):
+                if hasattr(ui.IwpFillPolicy, attr):
+                    image.fill_policy = getattr(ui.IwpFillPolicy, attr)
+                    break
+        except Exception as inner:
+            print(f"  (image widget fallback, no fill_policy: {inner})")
+            ui.ImageWithProvider(provider)
+
+    window.visible = True
+    try:
+        window.focus()
+    except Exception:
+        pass
+    return provider, window
+
+
+def _push_image(provider, frame_rgb, max_height=None):
+    """Push an HxWx3 uint8 RGB image to a ByteImageProvider."""
+    if provider is None or frame_rgb is None:
+        return
+
+    if max_height and frame_rgb.shape[0] > max_height:
+        from PIL import Image as PILImage
+
+        scale = max_height / frame_rgb.shape[0]
+        new_size = (int(frame_rgb.shape[1] * scale), max_height)
+        frame_rgb = np.array(PILImage.fromarray(frame_rgb).resize(new_size))
+
+    h, w = frame_rgb.shape[:2]
+    rgba = np.dstack(
+        [frame_rgb, np.full((h, w), 255, dtype=np.uint8)]
+    ).astype(np.uint8)
+    provider.set_bytes_data(rgba.flatten().tolist(), [w, h])
+
+
+def setup_live_view():
+    """Create (or recreate) the perception + coverage windows."""
+    if not LIVE_VIEW_ENABLED:
+        return
+
+    try:
+        import omni.ui as ui  # noqa: F401  (ensure importable before use)
+
+        print("… setup_live_view: creating omni.ui windows")
+
+        for key in ("viz_window", "coverage_window"):
+            old = _state.get(key)
+            if old is not None:
+                try:
+                    old.destroy()
+                except Exception:
+                    pass
+            _state[key] = None
+        _state["viz_provider"] = None
+        _state["coverage_provider"] = None
+
+        _state["viz_provider"], _state["viz_window"] = _make_image_window(
+            "Spot Perception", 1000, 430, 40, 40
+        )
+        _state["coverage_provider"], _state["coverage_window"] = _make_image_window(
+            "Coverage Map", 460, 460, 1060, 40
+        )
+
+        print(
+            "✓ Live windows created — find them under the top Window menu:\n"
+            "   Window > Spot Perception   (RGB | depth | sidewalk/not)\n"
+            "   Window > Coverage Map      (green = swept, blue = path)"
+        )
+    except Exception as e:
+        import traceback
+
+        print(f"⚠ Could not create live view windows: {e}")
+        traceback.print_exc()
+        _state["viz_provider"] = None
+        _state["coverage_provider"] = None
+
+
+def update_live_view(rgb, mask):
+    """Push the RGB | depth | sidewalk-binary composite to the window."""
+    provider = _state.get("viz_provider")
+    if provider is None:
+        return
+
+    try:
+        rgb_u8 = rgb_to_uint8(rgb)
+        if rgb_u8 is None:
+            return
+        h0 = rgb_u8.shape[0]
+
+        panels = [draw_region_lines(rgb_u8)]
+
+        for panel in (make_depth_view(), make_sidewalk_binary_image(mask)):
+            if panel is None:
+                continue
+            if panel.shape[0] != h0:
+                from PIL import Image as PILImage
+
+                new_w = int(panel.shape[1] * h0 / panel.shape[0])
+                panel = np.array(
+                    PILImage.fromarray(panel).resize((new_w, h0))
+                )
+            panels.append(panel)
+
+        frame = np.hstack(panels)
+        _push_image(provider, frame, max_height=LIVE_VIEW_MAX_HEIGHT)
+    except Exception as e:
+        print(f"Live view error: {e}")
+
+
+def update_coverage_view():
+    """Push the live top-down coverage map to the Coverage Map window."""
+    provider = _state.get("coverage_provider")
+    if provider is None:
+        return
+
+    try:
+        cov = render_coverage_map()
+        if cov is None:
+            return
+
+        # Nearest-neighbour upscale so early, tiny maps are still visible.
+        from PIL import Image as PILImage
+
+        scale = max(1, int(440 / max(cov.shape[0], 1)))
+        if scale > 1:
+            cov = np.array(
+                PILImage.fromarray(cov).resize(
+                    (cov.shape[1] * scale, cov.shape[0] * scale),
+                    PILImage.NEAREST,
+                )
+            )
+        _push_image(provider, cov, max_height=600)
+    except Exception as e:
+        print(f"Coverage view error: {e}")
 
 
 # =====================================================================
@@ -954,6 +1364,12 @@ async def run_demo():
         _state["last_save_step"] = 0
         _state["last_capture_step"] = 0
         _state["capture_frame_idx"] = 0
+        _state["last_live_step"] = 0
+        _state["coverage_covered"] = set()
+        _state["coverage_track"] = []
+        _state["last_coverage_step"] = 0
+        _state["sweep_dir"] = 1.0
+        _state["sweep_flips"] = 0
         _state["recovery_mode"] = None
         _state["recovery_reason"] = ""
         _state["recovery_cycles"] = 0
@@ -1021,6 +1437,8 @@ async def run_demo():
 
         print("✓ RGB + Semantic + Depth annotators attached")
 
+        setup_live_view()
+
         world.add_physics_callback(
             "physics_step",
             callback_fn=on_physics_step,
@@ -1073,6 +1491,14 @@ async def run_demo():
                     rgb_data = _state["rgb_annotator"].get_data()
                     _state["last_debug"] = (rgb_data, mask, l, c, r)
 
+                    # Live perception window (throttled)
+                    if (
+                        LIVE_VIEW_ENABLED
+                        and sc - _state["last_live_step"] >= LIVE_VIEW_EVERY_N_STEPS
+                    ):
+                        _state["last_live_step"] = sc
+                        update_live_view(rgb_data, mask)
+
                     if sc - last_log_step >= 100:
                         last_log_step = sc
 
@@ -1086,6 +1512,8 @@ async def run_demo():
                             f"pid_deriv={_state['pid_filtered_derivative']:+.2f}  "
                             f"internal_turn={_state['last_turn']:+.2f}  "
                             f"spot_turn={cmd[2]:+.2f}  "
+                            f"sweep_dir={_state['sweep_dir']:+.0f}  "
+                            f"sweep_flips={_state['sweep_flips']}  "
                             f"recovery={_state['recovery_mode']}  "
                             f"cycles={_state['recovery_cycles']}  "
                             f"reason={_state['recovery_reason']}  "
@@ -1107,6 +1535,20 @@ async def run_demo():
                     save_rgb_depth_frame()
                 except Exception as e:
                     print(f"RGB/depth capture error: {e}")
+
+            # Coverage: stamp the swath and refresh the live coverage map
+            if (
+                COVERAGE_ENABLED
+                and sc >= SETTLE_STEPS
+                and sc - _state["last_coverage_step"] >= COVERAGE_MARK_EVERY_N_STEPS
+            ):
+                _state["last_coverage_step"] = sc
+
+                try:
+                    mark_coverage_swath()
+                    update_coverage_view()
+                except Exception as e:
+                    print(f"Coverage error: {e}")
 
             # Debug save
             if (
@@ -1149,6 +1591,7 @@ async def run_demo():
         print(f"Captured {_state['capture_frame_idx']} RGB/depth frames.")
         print(f"Saved capture run to: {RUN_DIR}")
 
+        save_coverage_map()
         check_spot_orientation()
 
     except Exception as e:
