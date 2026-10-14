@@ -19,50 +19,81 @@ The Meshy scenes remain useful as an **out-of-distribution test set**.
 ## Pipeline
 
 ```bash
-# 1. scenes (offline, ~1 s/scene/worker)
-python scripts/crack_data/generate_crack_scenes.py --n 300
+python scripts/crack_data/fetch_textures.py                    # CC0 ambientCG -> D:/textures/acg
+python scripts/crack_data/generate_crack_scenes.py --n 500     # ~10 s/scene/worker, ~2.5 GB RAM/worker
+C:\isaacsim\python.bat scripts/crack_data/render_crack_dataset.py --views 16   # resumable
+python scripts/crack_data/build_crack_dataset.py               # CSVs, splits, YOLO-seg
 
-# 2. render (headless Isaac, ~1.5-2 s/frame on an RTX 3090; resumable)
-C:\isaacsim\python.bat scripts/crack_data/render_crack_dataset.py --views 16
-
-# 3. dataset tables, scene-level splits, YOLO-seg export (offline)
-python scripts/crack_data/build_crack_dataset.py
+# or all three, detached and resumable:
+powershell -ExecutionPolicy Bypass -File scripts/crack_data/run_full.ps1
 
 # checks
 python scripts/crack_data/crack_scene.py                       # self-test
-C:\isaacsim\python.bat scripts/crack_data/render_crack_dataset.py --validate --count 2 \
+C:\isaacsim\python.bat scripts/crack_data/render_crack_dataset.py --validate --count 3 \
     --scenes <dir> --out <dir>                                 # mask vs renderer
 python scripts/crack_data/contact_sheet.py --render <dir>      # eyeball masks
 ```
 
 Output defaults to `D:/sidewalk_crack_synth/` (C: is nearly full).
 
-## What is randomised
+## Scene content
 
-| | |
-|---|---|
-| Crack | pattern (transverse, longitudinal, diagonal, branching, map), width class hairline 0.8–2 mm / fine 2–5 / medium 5–12 / wide 12–30, depth 1–3x width-scaled, tortuosity, mm-scale jaggedness, tapering ends, dirt or weed fill |
-| Concrete | gray level, tint, broom finish, aggregate speckle, stains, gum spots, leaves (which hide cracks, and the label follows), slab-to-slab variation, tooled joints (unlabelled: a joint is not a crack) |
-| Lighting | sun elevation/azimuth/temperature/softness, overcast, 60 sky HDRIs, shadow-casting occluders, exposure (auto-exposure-like, per scene) |
-| Surface | wet (low roughness, darker) 15% |
-| Camera | Spot-like: height 0.45–0.75 m, pitch 30–65° down, roll ±3°, HFOV 70–95°, yaw ±30° along the walk, 20% looking back |
-| Surround | asphalt / road textures, grass, soil, gravel |
+**Walking surface** — broom concrete with photo detail (50%), exposed
+aggregate (12%), asphalt (16%), pavers / brick (22%, never cracked: a joint
+grid is a hard negative). Photo textures are CC0 ambientCG sets, each checked
+by eye for cracks of its own (Asphalt026C was excluded for exactly that).
+
+**Cracks** — on concrete, aggregate and asphalt. Patterns transverse,
+longitudinal, diagonal, branching, map (alligator on asphalt). Width classes
+hairline 0.8–2 mm / fine 2–5 / medium 5–12 / wide 12–30. Open depth up to
+30 mm; 40% partly dirt-filled, and the label is the open depth. Edge
+roughness varies along the crack (chips), with a worn bevelled lip.
+
+**Look-alikes, unlabelled** — tooled joints, driveway apron joints, sealant
+lines (repaired cracks), asphalt patches, locate paint, gum spots, stains,
+leaves. **Covers, which hide cracks under them** — manholes, utility lids,
+drain grates, tree pits (with trees), tactile pads.
+
+**Street** — curb + gutter + road (75%) or a verge, optional parkway strip,
+frontage (lawn, wall, building, fence, hedge), poles, trees, hydrants, bins,
+signs. The sidewalk continues past the labelled patch.
+
+**Lighting and camera** — sun + 60 sky HDRIs, overcast, wet surfaces,
+per-scene auto-exposure. Spot-like camera: 0.45–0.75 m high, 30–65° down,
+HFOV 70–95°.
 
 ## Labels
 
-- **Masks** come from depth: each pixel's depth gives the surface point it
-  shows; the texture is planar-UV mapped, so that point's (x, y) indexes the
-  label raster at exactly the spot whose colour the pixel shows. Occlusion and
-  perspective are therefore free. `--validate` renders the label raster as an
-  emissive texture and compares: same pixel count (no size bias), 1 px
-  boundary agreement ~0.94; strict IoU ~0.75 is the renderer's own edge
-  anti-aliasing on 2–5 px-wide structures.
-- **Measurements** are the generator's parameters, sampled every 0.5 mm along
-  the centreline: exact by construction. Columns match
-  `crack_detection`'s `visual_review.csv`.
-- **Visibility** per frame: `visible_pixels` and
-  `centerline_visible_fraction` (share of the centreline in frame and
-  unoccluded). Train measurement only on mostly-visible instances.
+- `mask/` uint16: crack instance id, 0 = none, **65535 = ignore** — crack
+  pixels narrower than 0.4 px at their range, or in clipped highlight /
+  crushed shadow. Labelled but not visible: train neither way on them.
+- Masks come from depth: each pixel's depth gives the surface point it
+  shows; the texture is planar-UV mapped, so that point indexes the label
+  raster exactly where the pixel's colour came from. `--validate` renders the
+  label raster as an emissive texture: IoU 0.94–0.98 on cracks ≥2 px wide;
+  lower only for sub-pixel cracks (texture filtering), which is the ignore
+  regime.
+- Measurements are the generator's parameters, sampled every 0.5 mm:
+  exact. Columns match `crack_detection`'s `visual_review.csv`.
+- Per frame visibility: `visible_pixels`, `ignore_pixels`,
+  `centerline_visible_fraction`, `width_px_at_center`. Train measurement
+  only on mostly-visible, resolvable instances.
+
+## Depth
+
+- `depth/` uint16 exact z-depth in 0.1 mm (float16 was too coarse for crack
+  depths: 1–2 mm steps at 1–4 m).
+- `depth_stereo/` uint16, half resolution, Spot-like stereo: noise σ = k·z²
+  (k 0.004–0.012 /m), matching-window blur that erases narrow cracks, edge
+  dropouts, holes. Train depth-using models on this one; a real stereo pair
+  never sees the exact map.
+
+## Render settings
+
+Isaac's default anti-aliasing is DLSS *Performance*, which renders at about
+half resolution and upscales — it smeared texture and erased hairline
+cracks. The renderer sets DLAA (`/rtx/post/aa/op = 4`, native resolution):
+~40% sharper, validation IoU 0.75 → 0.86 mean.
 
 ## Splits
 
@@ -71,9 +102,8 @@ independent samples. Adding scenes never moves existing ones between splits.
 
 ## Known limits
 
-- Concrete is procedural; no photographed concrete textures are available
-  locally. Real-photo validation is the open question.
-- Measurement labels are 3-D truth; from one image, depth of a narrow crack
-  is not observable. Expect width and length to be learnable, depth weakly.
-- Hairline cracks under ~1.5 mm are below one pixel beyond ~1 m range; they
-  are labelled where they render, but the image may show them only faintly.
+- Single image cannot observe the depth of a narrow crack; expect width and
+  length to be learnable, depth weakly (stereo helps only for wide cracks).
+- Pavers carry no cracks; cracked pavers are a separate defect.
+- Props are primitive shapes (cylinders, boxes); they serve as occluders and
+  shadow casters, not as realistic objects.

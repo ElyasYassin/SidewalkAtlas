@@ -14,10 +14,13 @@ import numpy as np
 
 
 def overlay(rgb, mask):
+    """Crack outlines red; IGNORE (65535, too thin to resolve) yellow."""
     out = rgb.copy()
-    m = (mask > 0).astype(np.uint8)
-    edge = cv2.morphologyEx(m, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) > 0
-    out[edge] = (0, 0, 255)
+    k = np.ones((3, 3), np.uint8)
+    for sel, col in (((mask > 0) & (mask < 65535), (0, 0, 255)),
+                     (mask == 65535, (0, 230, 255))):
+        edge = cv2.morphologyEx(sel.astype(np.uint8), cv2.MORPH_GRADIENT, k) > 0
+        out[edge] = col
     return out
 
 

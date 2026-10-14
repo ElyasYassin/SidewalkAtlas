@@ -52,12 +52,13 @@ REVIEW_COLUMNS = [
 ]
 EXTRA_CRACK = ["scene_id", "instance_id", "split", "pattern", "width_class",
                "n_branches", "tortuosity", "pca_length_m", "pca_width_m",
-               "area_over_length_m", "visible_raster_cells"]
-EXTRA_INSTANCE = ["frame", "rgb", "depth", "mask", "visible_pixels",
-                  "centerline_visible_fraction", "bbox_x0", "bbox_y0",
-                  "bbox_x1", "bbox_y1", "range_m", "view_elev_deg",
-                  "cam_height_m", "cam_pitch_deg", "hfov_deg", "wet",
-                  "overcast", "hdri"]
+               "area_over_length_m", "visible_raster_cells", "fill_fraction"]
+EXTRA_INSTANCE = ["frame", "rgb", "depth", "depth_stereo", "mask",
+                  "visible_pixels", "ignore_pixels",
+                  "centerline_visible_fraction", "width_px_at_center",
+                  "bbox_x0", "bbox_y0", "bbox_x1", "bbox_y1", "range_m",
+                  "view_elev_deg", "cam_height_m", "cam_pitch_deg", "hfov_deg",
+                  "wet", "overcast", "hdri", "surface", "fill_fraction"]
 
 
 def split_of(scene_id):
@@ -160,8 +161,12 @@ def main():
                 bb = v.get("bbox_xyxy", ["", "", "", ""])
                 row.update({
                     "scene_id": s, "split": sp, "frame": name, "rgb": rgb,
-                    "depth": os.path.join(a.render, "depth", name + ".npz"),
+                    "depth": os.path.join(a.render, "depth", name + ".png"),
+                    "depth_stereo": os.path.join(a.render, "depth_stereo", name + ".png"),
                     "mask": mask_p, "visible_pixels": v["visible_pixels"],
+                    "ignore_pixels": v.get("ignore_pixels", 0),
+                    "width_px_at_center": v.get("width_px_at_center", ""),
+                    "surface": f.get("surface", ""),
                     "centerline_visible_fraction": v["centerline_visible_fraction"],
                     "bbox_x0": bb[0], "bbox_y0": bb[1], "bbox_x1": bb[2],
                     "bbox_y1": bb[3], "range_m": v.get("range_m", ""),
