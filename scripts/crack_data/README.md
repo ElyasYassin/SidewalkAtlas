@@ -100,6 +100,25 @@ cracks. The renderer sets DLAA (`/rtx/post/aa/op = 4`, native resolution):
 By scene (`sha1(scene_id)`), never by frame: 16 views of one slab are not
 independent samples. Adding scenes never moves existing ones between splits.
 
+## Running it on this machine (lessons from the first full run)
+
+- **One renderer only** on 32 GB RAM. Two renderers plus scene generation
+  exhausted memory and crashed the PC. `--nshards/--shard/--follow` exist
+  for machines with more RAM.
+- **Omniverse texture cache fills C:.** Every scene adds ~100 MB of one-use
+  cached textures under `%LOCALAPPDATA%\ov\cache\texturecache`; 430 scenes
+  left C: with 0.4 GB. Run `trim_texture_cache.ps1` alongside the renderer.
+- **VRAM is not released between scenes.** After ~280 scenes the GPU sat at
+  22.7/24 GB and frames slowed ~10x. Restart the renderer every ~250 scenes
+  (it resumes from `frames*.jsonl`; drop the last scene if it has <16 views).
+- Never stop a parent shell that a generator is printing into: the
+  generator dies on its next write. Launch detached with output to a file.
+- `finish_when_done.ps1` builds the tables once no renderer or generator is
+  running.
+
+First full run: 500 scenes, 7,942 frames, 9,102 crack instances, 1,621
+unique cracks; split 406 / 44 / 50 scenes (6,450 / 704 / 788 frames).
+
 ## Known limits
 
 - Single image cannot observe the depth of a narrow crack; expect width and

@@ -40,7 +40,7 @@ SCENES_DIR = "D:/sidewalk_crack_synth/scenes"
 SPLIT = {"train": 0.8, "val": 0.1, "test": 0.1}
 MIN_VISIBLE_PX = 20
 POLY_EPSILON_PX = 0.8
-MIN_POLY_AREA_PX = 4.0
+MIN_POLY_AREA_PX = 10.0
 
 # visual_review.csv column order, so both sources load with one reader.
 REVIEW_COLUMNS = [
@@ -81,11 +81,17 @@ def review_row(scene_id, rec, image=""):
 
 
 def mask_polygons(mask, iid):
+    """Polygons for one crack instance. A thin crack broken by ignore pixels
+    or occluders traces as dozens of fragments, which YOLO would learn as
+    separate objects; close gaps of a few px first (polygon export only --
+    the masks stay exact), and drop specks."""
     m = (mask == iid).astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE,
+                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
     contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     out = []
     for c in contours:
-        if cv2.contourArea(c) < MIN_POLY_AREA_PX and len(c) < 4:
+        if cv2.contourArea(c) < MIN_POLY_AREA_PX or len(c) < 6:
             continue
         a = cv2.approxPolyDP(c, POLY_EPSILON_PX, True).reshape(-1, 2)
         if len(a) >= 3:
