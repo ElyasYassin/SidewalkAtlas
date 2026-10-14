@@ -21,18 +21,29 @@ python scripts/terrain/sidewalk_terrain.py                    # generator self-t
 python scripts/terrain/generate_dataset.py --n 200 --out data/terrain
 python scripts/Isaac_sim/export_yolo_dataset.py               # capture -> YOLO-seg
 python scripts/Isaac_sim/depth_video.py                       # depth-gradient video
+python scripts/crack_data/crack_scene.py                      # crack generator self-test
+python scripts/crack_data/generate_crack_scenes.py --n 300    # crack scenes -> D:
+python scripts/crack_data/build_crack_dataset.py              # CSVs, splits, YOLO-seg
 ```
+
+**Isaac standalone** (headless, `C:\isaacsim\python.bat`, no open stage):
+`crack_data/render_crack_dataset.py` -- renders the crack scenes to RGB,
+depth and exact masks. See `scripts/crack_data/README.md`.
 
 **Inside Isaac Sim** (Script Editor; needs `omni.*`, `pxr`, an open stage):
 `walking.py`, `spot_walk_with_evenness_autosave.py`,
 `capture_crack_dataset.py`, `crack_detection/*`,
 `terrain/import_terrain_isaac.py`.
 
-There is no build, lint or test runner. `sidewalk_terrain.py` self-tests when
-run directly; keep it passing.
+There is no build, lint or test runner. `sidewalk_terrain.py` and
+`crack_scene.py` self-test when run directly; keep them passing.
 
 ## Architecture
 
+- `scripts/crack_data/` — **current goal**: Isaac as a ground-truth factory
+  for a crack detection + measurement model. Procedural cracks whose
+  geometry, texture and labels come from one definition; masks from depth,
+  measurements exact; splits by scene.
 - `scripts/terrain/` — parametric sidewalk heightfield synthesis with exact
   ground truth. Pure numpy, Isaac-free, so it can be iterated without the
   simulator. Labels come from the generative parameters, not from measurement.
